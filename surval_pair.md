@@ -1,0 +1,329 @@
+#“pair生存分析前的数据整理”
+
+## https://blog.csdn.net/weixin_48275332/article/details/124187962
+
+rm(list=ls())
+proj = "TCGA-LIHC"
+load(paste0(proj,".Rdata"))
+library(stringr)
+
+## 可以仿照这个将RNA_seq测序的count数据转换成cpm数据，即表达矩阵，这个矩阵可用来画热图
+exprSet=log2(edgeR::cpm(exp)+1) 
+ncol(exprSet)
+
+# 对行进行计算，每行中至少有一半的样本的值大于0
+k = apply(exprSet,1, function(x){sum(x>0)>0.5*ncol(exprSet)});table(k) 
+exprSet = exprSet[k,]
+nrow(exprSet)
+
+
+library(dplyr)
+meta = left_join(surv,clinical,by = c("sample"= "submitter_id.samples"))
+# 去掉表达矩阵里没有的样本
+library(stringr)
+k = meta$sample %in% colnames(exprSet);table(k)
+meta = meta[k,]
+
+# 去掉生存信息不全或者生存时间小于30天的样本，样本纳排标准不唯一，且差别很大
+k1 = meta$OS.time >= 30;table(k1)
+k2 = !(is.na(meta$OS.time)|is.na(meta$OS));table(k2)
+meta = meta[k1&k2,]
+
+# 选择有用的列
+tmp = data.frame(colnames(meta))
+meta = meta[,c(
+  'sample',
+  'OS',
+  'OS.time',
+  'race.demographic',
+  'age_at_initial_pathologic_diagnosis',
+  'gender.demographic' ,
+  'tumor_stage.diagnoses'
+)]
+
+dim(meta)
+rownames(meta) <- meta$sample
+meta[1:4,1:4]
+
+#简化meta的列名
+colnames(meta)=c('ID','event','time','race','age','gender','stage')
+
+#空着的值、not reported改为NA
+meta[meta==""|meta=="not reported"]=NA
+
+# ## (1) 以病人为中心，对表达矩阵的列按照病人ID去重复，每个病人只保留一个样本。
+# exprSet = exprSet[,sort(colnames(exprSet))]
+# k = !duplicated(str_sub(colnames(exprSet),1,12));table(k)
+# exprSet = exprSet[,k] 
+
+## (2) 以样本为中心，如果每个病人有多个样本则全部保留。(删掉上面这一段代码即可)
+#调整meta行名与exprSet列名一一对应
+s = intersect(rownames(meta),colnames(exprSet))
+exprSet = exprSet[,s]
+meta = meta[s,]
+identical(rownames(meta),colnames(exprSet))
+
+
+# Assuming surv is your data frame and sample is the column name
+# Extract the prefix before the last three characters (the sample type identifier)
+meta$prefix <- sub("(.*)-..A$", "\\1", meta$ID)
+# Identify tumor and normal samples based on the ending
+tumor_samples <- meta[grepl("-0.A$", meta$ID), ]
+normal_samples <- meta[grepl("-1.A$", meta$ID), ]
+meta$group <- ifelse(grepl("-0.A$", meta$ID), "tumor", "normal")
+# Find common prefixes between tumor and normal samples
+common_prefixes <- intersect(tumor_samples$prefix, normal_samples$prefix)
+# Filter the original dataframe to include only those pairs
+meta <- meta[meta$prefix %in% common_prefixes, ]
+# Drop the temporary prefix column if you don't need it
+exprSet <- exprSet[,meta$ID]
+
+taget_gene='TIMP3'
+meta$gene <- exprSet[taget_gene,]
+# Assuming 'meta' is your dataframe
+library(dplyr)
+
+# Create a new column 'exp' with NA values
+meta$exp <- NA
+
+# Use dplyr to compare tumor and normal values within the same sample
+meta <- meta %>%
+  group_by(prefix) %>%
+  mutate(exp = ifelse(gene[group == "tumor"] > gene[group == "normal"], "high", "low")) %>%
+  ungroup()
+
+meta <- meta %>%
+  filter(group != "normal")
+
+
+
+
+# 生存分析的输入数据里，要求结局事件必须用0和1表示，0表示活着，1表示死了;
+# 生存时间的单位（月）
+table(meta$event)
+range(meta$time)
+meta$time = meta$time/30
+range(meta$time)
+
+# 抹除stage里的重复信息
+
+head(meta$stage)
+
+meta$stage = meta$stage %>% 
+  str_remove("stage ") %>% 
+  str_to_upper()
+
+table(meta$stage,useNA = "always")
+
+# 不需要ABC可以去掉，需要的话就保留，不运行下面这句
+meta$stage = str_remove(meta$stage,"A|B|C") 
+
+head(meta)
+
+save(meta,exprSet,proj,file = paste0(proj,"_sur_model.Rdata"))
+
+
+# 生存分析
+## KM-plot
+
+rm(list = ls())
+proj = "TCGA-LIHC"
+load(paste0(proj,"_sur_model.Rdata"))
+ls()
+exprSet[1:4,1:4]
+meta[1:4,1:4]
+
+library(survival)
+library(survminer)
+
+
+
+
+sfit=survfit(Surv(`time`, `event`)~exp, data=meta)
+ggsurvplot(sfit,pval =TRUE, data = meta, risk.table = TRUE)
+
+
+## log-rank test for every gene
+
+logrankfile = paste0(proj,"_log_rank_p.Rdata")
+if(!file.exists(logrankfile)){
+  log_rank_p <- apply(exprSet , 1 , function(gene){
+    meta$group=ifelse(gene>median(gene),'high','low')  
+    data.survdiff=survdiff(Surv(time, event)~group,data=meta)
+    p.val = 1 - pchisq(data.survdiff$chisq, length(data.survdiff$n) - 1)
+    return(p.val)
+  })
+  log_rank_p=sort(log_rank_p)
+  save(log_rank_p,file = logrankfile)
+}
+load(logrankfile)
+table(log_rank_p<0.01) 
+table(log_rank_p<0.05) 
+
+
+## 批量单因素cox
+coxfile = paste0(proj,"_cox.Rdata")
+if(!file.exists(coxfile)){
+  cox_results <-apply(exprSet , 1 , function(gene){
+    meta$gene = gene
+    #可直接使用连续型变量
+    m = coxph(Surv(time, event) ~ gene, data =  meta)
+    #也可使用二分类变量
+    #meta$group=ifelse(gene>median(gene),'high','low') 
+    #meta$group = factor(meta$group,levels = c("low","high"))
+    #m=coxph(Surv(time, event) ~ group, data =  meta)
+    
+    beta <- coef(m)
+    se <- sqrt(diag(vcov(m)))
+    HR <- exp(beta)
+    HRse <- HR * se
+    
+    #summary(m)
+    tmp <- round(cbind(coef = beta, 
+                       se = se, z = beta/se, 
+                       p = 1 - pchisq((beta/se)^2, 1),
+                       HR = HR, HRse = HRse,
+                       HRz = (HR - 1) / HRse, 
+                       HRp = 1 - pchisq(((HR - 1)/HRse)^2, 1),
+                       HRCILL = exp(beta - qnorm(.975, 0, 1) * se),
+                       HRCIUL = exp(beta + qnorm(.975, 0, 1) * se)), 3)
+    
+    return(tmp['gene',]) 
+    #return(tmp['grouphigh',])#二分类变量
+  })
+  cox_results=as.data.frame(t(cox_results))
+  save(cox_results,file = coxfile)
+}
+load(coxfile)
+table(cox_results$p<0.01)
+table(cox_results$p<0.05)
+
+lr = names(log_rank_p)[log_rank_p<0.01];length(lr)
+cox = rownames(cox_results)[cox_results$p<0.01];length(cox)
+length(intersect(lr,cox))
+save(lr,cox,file = paste0(proj,"_logrank_cox_gene.Rdata"))
+
+
+# lasso回归
+rm(list = ls())
+proj = "TCGA-LIHC"
+load(paste0(proj,"_sur_model.Rdata"))
+ls()
+exprSet[1:4,1:4]
+meta[1:4,1:4]
+load(paste0(proj,"_logrank_cox_gene.Rdata"))
+exprSet = exprSet[cox,]
+
+x=t(exprSet)  # x行名为样本，列名为基因
+y=meta$event
+library(glmnet)
+
+
+#调优参数
+set.seed(1006) # 选取不同的数，画出来的效果不同
+cv_fit <- cv.glmnet(x=x, y=y)
+plot(cv_fit)
+
+#系数图
+fit <- glmnet(x=x, y=y)
+plot(fit,xvar = "lambda")
+
+
+model_lasso_min <- glmnet(x=x, y=y,lambda=cv_fit$lambda.min)
+model_lasso_1se <- glmnet(x=x, y=y,lambda=cv_fit$lambda.1se)
+
+
+head(model_lasso_min$beta,20)
+choose_gene_min=rownames(model_lasso_min$beta)[as.numeric(model_lasso_min$beta)!=0]
+choose_gene_1se=rownames(model_lasso_1se$beta)[as.numeric(model_lasso_1se$beta)!=0]
+length(choose_gene_min)
+length(choose_gene_1se)
+save(choose_gene_min,file = paste0(proj,"_lasso_choose_gene_min.Rdata"))
+save(choose_gene_1se,file = paste0(proj,"_lasso_choose_gene_1se.Rdata"))
+
+
+
+
+
+
+
+
+
+# 模型预测和评估ROC curve
+lasso.prob <- predict(cv_fit, newx=x , s=c(cv_fit$lambda.min,cv_fit$lambda.1se) )
+re=cbind(y ,lasso.prob)
+head(re)
+re=as.data.frame(re)
+colnames(re)=c('event','prob_min','prob_1se')
+re$event=as.factor(re$event)
+
+
+library(pROC)
+library(ggplot2)
+m <- roc(meta$event, re$prob_min)
+g <- ggroc(m,legacy.axes = T,size = 1,color = "#2fa1dd")
+auc(m)  # Area under the curve: 0.9953
+
+g + theme_minimal() +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), 
+               colour = "grey", linetype = "dashed")+
+  annotate("text",x = .75, y = .25,
+           label = paste("AUC of min = ",format(round(as.numeric(auc(m)),2),nsmall = 2)),color = "#2fa1dd")
+
+
+m2 <- roc(meta$event, re$prob_1se)
+auc(m2)  # Area under the curve: 0.7426
+g <- ggroc(list(min = m,se = m2),legacy.axes = T,size = 1)
+
+g + theme_minimal() +
+  scale_color_manual(values = c("#2fa1dd", "#f87669"))+
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), 
+               colour = "grey", linetype = "dashed")+
+  annotate("text",x = .75, y = .25,
+           label = paste("AUC of min = ",format(round(as.numeric(auc(m)),2),nsmall = 2)),color = "#2fa1dd")+
+  annotate("text",x = .75, y = .15,
+           label = paste("AUC of 1se = ",format(round(as.numeric(auc(m2)),2),nsmall = 2)),color = "#f87669")
+
+
+# cox-forest
+
+rm(list = ls())
+proj = "TCGA-LIHC"
+if(!require(My.stepwise))install.packages("My.stepwise")
+load(paste0(proj,"_sur_model.Rdata"))
+load(paste0(proj,"_lasso_choose_gene_1se.Rdata"))
+g = choose_gene_1se
+
+
+library(stringr)
+e=t(exprSet[g,])
+colnames(e)= str_replace_all(colnames(e),"-","_")
+dat=cbind(meta,e)
+
+dat$gender=as.numeric(factor(dat$gender))
+dat$stage=as.numeric(factor(dat$stage))
+colnames(dat)
+
+
+library(survival)
+library(survminer)
+library(MASS) 
+# 不能允许缺失值
+dat2 = na.omit(dat)
+vl <- colnames(dat2)[c(5:ncol(dat2))]
+
+
+full_model <- coxph(Surv(time, event) ~ ., data = dat2[, c("time", "event", vl)])
+
+stepwise_model <- stepAIC(full_model, direction = "both")
+
+names(coef(stepwise_model))
+
+formula_string <- paste("Surv(time, event) ~", paste(significant_vars, collapse = " + "))
+model_formula <- as.formula(formula_string)
+
+# Fit the Cox model using only the significant variables
+final_model <- coxph(model_formula, data = dat2)
+
+
+
