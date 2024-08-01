@@ -1,5 +1,4 @@
-#“pair生存分析前的数据整理”
-
+#“生存分析前的数据整理”
 ## https://blog.csdn.net/weixin_48275332/article/details/124187962
 
 rm(list=ls())
@@ -7,12 +6,11 @@ proj = "TCGA-LIHC"
 load(paste0(proj,".Rdata"))
 library(stringr)
 
-## 可以仿照这个将RNA_seq测序的count数据转换成cpm数据，即表达矩阵，这个矩阵可用来画热图
-exprSet=log2(edgeR::cpm(exp)+1) 
+
+exprSet=log2(edgeR::cpm(exp[,Group=='tumor'])+1) ## 可以仿照这个将RNA_seq测序的count数据转换成cpm数据，即表达矩阵，这个矩阵可用来画热图
 ncol(exprSet)
 
-# 对行进行计算，每行中至少有一半的样本的值大于0
-k = apply(exprSet,1, function(x){sum(x>0)>0.5*ncol(exprSet)});table(k) 
+k = apply(exprSet,1, function(x){sum(x>0)>0.5*ncol(exprSet)});table(k) # 对行进行计算，每行中至少有一半的样本的值大于0
 exprSet = exprSet[k,]
 nrow(exprSet)
 
@@ -56,46 +54,13 @@ meta[meta==""|meta=="not reported"]=NA
 # k = !duplicated(str_sub(colnames(exprSet),1,12));table(k)
 # exprSet = exprSet[,k] 
 
+
 ## (2) 以样本为中心，如果每个病人有多个样本则全部保留。(删掉上面这一段代码即可)
 #调整meta行名与exprSet列名一一对应
 s = intersect(rownames(meta),colnames(exprSet))
 exprSet = exprSet[,s]
 meta = meta[s,]
 identical(rownames(meta),colnames(exprSet))
-
-
-# Assuming surv is your data frame and sample is the column name
-# Extract the prefix before the last three characters (the sample type identifier)
-meta$prefix <- sub("(.*)-..A$", "\\1", meta$ID)
-# Identify tumor and normal samples based on the ending
-tumor_samples <- meta[grepl("-0.A$", meta$ID), ]
-normal_samples <- meta[grepl("-1.A$", meta$ID), ]
-meta$group <- ifelse(grepl("-0.A$", meta$ID), "tumor", "normal")
-# Find common prefixes between tumor and normal samples
-common_prefixes <- intersect(tumor_samples$prefix, normal_samples$prefix)
-# Filter the original dataframe to include only those pairs
-meta <- meta[meta$prefix %in% common_prefixes, ]
-# Drop the temporary prefix column if you don't need it
-exprSet <- exprSet[,meta$ID]
-
-taget_gene='TIMP3'
-meta$gene <- exprSet[taget_gene,]
-# Assuming 'meta' is your dataframe
-library(dplyr)
-
-# Create a new column 'exp' with NA values
-meta$exp <- NA
-
-# Use dplyr to compare tumor and normal values within the same sample
-meta <- meta %>%
-  group_by(prefix) %>%
-  mutate(exp = ifelse(gene[group == "tumor"] > gene[group == "normal"], "high", "low")) %>%
-  ungroup()
-
-meta <- meta %>%
-  filter(group != "normal")
-
-
 
 
 # 生存分析的输入数据里，要求结局事件必须用0和1表示，0表示活着，1表示死了;
@@ -136,10 +101,26 @@ meta[1:4,1:4]
 library(survival)
 library(survminer)
 
+sfit <- survfit(Surv(time, event)~gender, data=meta)
+ggsurvplot(sfit,pval=TRUE)
+ggsurvplot(sfit,
+           palette = "jco",
+           risk.table =TRUE,
+           pval =TRUE,
+           conf.int =TRUE)
 
 
+## 年龄
+group = ifelse(meta$age>median(meta$age,na.rm = T),"older","younger")
+table(group)
+sfit=survfit(Surv(time, event)~group, data=meta)
+ggsurvplot(sfit,pval =TRUE, data = meta, risk.table = TRUE)
 
-sfit=survfit(Surv(`time`, `event`)~exp, data=meta)
+
+## gene
+g = "TIMP3"
+meta$gene = ifelse(exprSet[g,]> median(exprSet[g,]),'high','low')
+sfit=survfit(Surv(time, event)~gene, data=meta)
 ggsurvplot(sfit,pval =TRUE, data = meta, risk.table = TRUE)
 
 
@@ -327,3 +308,4 @@ final_model <- coxph(model_formula, data = dat2)
 
 
 
+      
